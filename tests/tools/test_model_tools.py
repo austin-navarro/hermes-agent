@@ -11,6 +11,7 @@ from model_tools import (
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
 )
+from tools.registry import registry
 
 
 # =========================================================================
@@ -18,6 +19,75 @@ from model_tools import (
 # =========================================================================
 
 class TestHandleFunctionCall:
+    def test_registry_handler_receives_complete_trusted_call_identity(self):
+        tool_name = "identity_dispatch_sentinel"
+        received = []
+
+        def handler(args, **kwargs):
+            received.append((args, kwargs))
+            return json.dumps({"ok": True})
+
+        registry.register(
+            name=tool_name,
+            toolset="identity-dispatch-test",
+            schema={"description": "test sentinel", "parameters": {"type": "object"}},
+            handler=handler,
+        )
+        try:
+            result = json.loads(handle_function_call(
+                tool_name,
+                {"value": "exact"},
+                task_id="task-exact",
+                session_id="session-exact",
+                turn_id="turn-exact",
+                tool_call_id="tool-call-exact",
+                api_request_id="api-request-exact",
+            ))
+        finally:
+            registry.deregister(tool_name)
+
+        assert result == {"ok": True}
+        assert received == [(
+            {"value": "exact"},
+            {
+                "task_id": "task-exact",
+                "session_id": "session-exact",
+                "turn_id": "turn-exact",
+                "tool_call_id": "tool-call-exact",
+                "api_request_id": "api-request-exact",
+                "user_task": None,
+            },
+        )]
+
+    def test_registry_handler_missing_call_identity_is_not_synthesized(self):
+        tool_name = "missing_identity_dispatch_sentinel"
+        received = []
+
+        def handler(args, **kwargs):
+            received.append(kwargs)
+            return json.dumps({"ok": True})
+
+        registry.register(
+            name=tool_name,
+            toolset="identity-dispatch-test",
+            schema={"description": "test sentinel", "parameters": {"type": "object"}},
+            handler=handler,
+        )
+        try:
+            result = json.loads(handle_function_call(tool_name, {}))
+        finally:
+            registry.deregister(tool_name)
+
+        assert result == {"ok": True}
+        assert received == [{
+            "task_id": None,
+            "session_id": None,
+            "turn_id": None,
+            "tool_call_id": None,
+            "api_request_id": None,
+            "user_task": None,
+        }]
+
     def test_agent_loop_tool_returns_error(self):
         for tool_name in _AGENT_LOOP_TOOLS:
             result = json.loads(handle_function_call(tool_name, {}))
