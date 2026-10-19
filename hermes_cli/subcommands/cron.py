@@ -48,6 +48,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Skip the LLM entirely — run --script on schedule and deliver "
             "its stdout directly. Empty stdout = silent. Classic watchdog "
             "pattern (memory alerts, disk alerts, CI pings).")
+    cron_create.add_argument(
+        "--no-agent-output", choices=["multipart-v1"],
+        help="Opt in to strict versioned JSON multipart stdout (requires --no-agent).")
     cron_create.add_argument("--monitor-script", dest="monitor_script",
         help="Monitor mode: path to a cheap source script under "
             "~/.hermes/scripts/ that runs each tick BEFORE the agent. "
@@ -112,6 +115,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "existing script on the job).")
     cron_edit.add_argument("--agent", dest="no_agent", action="store_const", const=False,
         help="Disable no-agent mode on this job (reverts to LLM-driven execution).")
+    cron_edit.add_argument(
+        "--no-agent-output", choices=["multipart-v1"],
+        help="Opt in to strict versioned JSON multipart stdout (requires --no-agent).")
     cron_edit.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Turn on run-to-run continuity: each run sees the job's own "

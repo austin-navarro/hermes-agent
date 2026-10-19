@@ -1276,7 +1276,8 @@ class _TargetDelivery:
     in_channel_surface: bool
     inchannel_continuable: bool
     opened_thread_id: Optional[str]
-    live_adapter_ready: bool = False
+    live_adapter_ready: bool
+    verbatim: bool = False
 
     @property
     def is_relay(self) -> bool:
@@ -1456,6 +1457,7 @@ def _live_send_text(
             "assuming delivered (skipping standalone fallback "
             "to avoid duplicate)",
             job["id"], t.platform_name, t.chat_id)
+        unverified_targets.append(t.where)
         return True, True, None
     except Exception as ex:
         # Real send error (not a slow confirmation): fall through to standalone.
@@ -1484,6 +1486,8 @@ def _live_send_text(
         _warn_live_lane_failure(job, msg, t.is_relay)
         target_errors.append(msg)
         return False, False, None
+    if delivered_message_id is not None:
+        job.setdefault("_last_delivery_message_ids", []).append(delivered_message_id)
     if send_raw_response and t.thread_id and send_raw_response.get("thread_fallback"):
         requested_thread_id = send_raw_response.get("requested_thread_id") or t.thread_id
         _note_target_error(
@@ -1577,7 +1581,7 @@ def _deliver_via_live_adapter(
     try:
         # Send cleaned text (MEDIA tags stripped) through the gateway's DeliveryRouter so it gets
         # the same platform routing as live messages (Telegram's three-mode topic routing).
-        text_to_send = cleaned_text.strip()
+        text_to_send = cleaned_text if t.verbatim else cleaned_text.strip()
         adapter_ok, timed_out, delivered_message_id = True, False, None
         if not text_to_send and not media_files:
             # Fail closed so the run reports the empty payload.
@@ -1705,6 +1709,8 @@ def _deliver_standalone(
         target_errors.append(err)
         delivery_errors.extend(target_errors)
         return
+    if isinstance(result, dict) and result.get("message_id") is not None:
+        job.setdefault("_last_delivery_message_ids", []).append(result["message_id"])
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
     for _w in (result.get("warnings") if isinstance(result, dict) else None) or []:
@@ -1721,7 +1727,7 @@ def _deliver_standalone(
 
 def _prepare_target_delivery(
     job: dict, target: dict, *, adapters, loop, config, notify_delivery: bool, mirror_enabled: bool,
-    mirror_text: str, delivery_errors: list,
+    mirror_text: str, delivery_errors: list, verbatim: bool = False,
 ) -> Optional[_TargetDelivery]:
     """Per-target prologue of ``_deliver_result``: origin/mirror/in_channel gates, transport
     resolution, continuable-thread open. None (error noted in ``delivery_errors``) if unservable."""
@@ -1822,7 +1828,8 @@ def _prepare_target_delivery(
         origin=origin, origin_target=origin_target, origin_user_id=origin_user_id,
         is_dm_target=is_dm_target, mirror_text=mirror_text, mirror_this_target=mirror_this_target,
         in_channel_surface=in_channel_surface, inchannel_continuable=inchannel_continuable,
-        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
+        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready,
+        verbatim=verbatim)
 
 
 def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
@@ -1849,7 +1856,8 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
 
 
 def _deliver_result(
-    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
+    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False,
+    verbatim: bool = False, delivery_identity: Optional[str] = None,
 ) -> Optional[str]:
     """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
@@ -1857,6 +1865,7 @@ def _deliver_result(
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
+    job.pop("_last_delivery_message_ids", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         _record_delivery_verification(job, [])
@@ -1874,9 +1883,10 @@ def _deliver_result(
         from cron.delivery_queue import enqueue_and_wait
 
         _record_delivery_verification(job, [])
-        error = enqueue_and_wait(external_execution, job, content, for_failure=for_failure)
+        queue_identity = delivery_identity or external_execution
+        error = enqueue_and_wait(queue_identity, job, content, for_failure=for_failure)
         from cron.delivery_queue import get_status
-        delivery_status = get_status(external_execution)
+        delivery_status = get_status(queue_identity)
         if delivery_status and delivery_status["status"] == "suppressed":
             job["_notification_all_targets_suppressed"] = True
         from cron.jobs import get_job
@@ -1897,7 +1907,7 @@ def _deliver_result(
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
-    if wrap_response:
+    if wrap_response and not verbatim:
         task_name = job.get("name", job["id"])
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
@@ -1915,7 +1925,11 @@ def _deliver_result(
     # at boot; standalone runs (`hermes cron run`) did not, silently dropping files. Idempotent.
     from gateway.media_policy import apply_media_policy_env
     apply_media_policy_env(user_cfg)
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+    if verbatim:
+        # Multipart-v1 is text-only: MEDIA-looking text is body content, never an attachment command.
+        media_files, cleaned_delivery_content = [], delivery_content
+    else:
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     # Redact at this single chokepoint, BEFORE the live-adapter / standalone send lanes below.
     # Shell-job stdout/stderr is already redacted where it is captured, but an LLM cron job's
     # response text reaches delivery unscanned — so a job that surfaced a credential (echoed a
@@ -1939,7 +1953,10 @@ def _deliver_result(
         mirror_enabled = False
     # Independent of the mirror knob: continuable surfaces (in_channel) must seed even when
     # attach_to_session=false and cron.mirror_delivery=false, else the seed gets "" and fails.
-    _, mirror_text = BasePlatformAdapter.extract_media(content)
+    if verbatim:
+        mirror_text = content
+    else:
+        _, mirror_text = BasePlatformAdapter.extract_media(content)
     # Derived from the raw `content`, so it does NOT inherit the redaction above. Without this,
     # enabling the mirror writes an unredacted credential into the session transcript even though
     # the chat message itself was clean — and a transcript outlives the message.
@@ -1978,7 +1995,8 @@ def _deliver_result(
         t = _prepare_target_delivery(
             job, target, adapters=adapters, loop=loop, config=config,
             notify_delivery=notify_delivery,
-            mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
+            mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors,
+            verbatim=verbatim)
         if t is None:
             continue
         target_errors: list = []

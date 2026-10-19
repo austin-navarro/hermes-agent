@@ -41,7 +41,9 @@ def _connect() -> sqlite3.Connection:
 
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    return open_db(
+        path, db_label="cron/executions.db", synchronous_full=True,
+        foreign_keys=True, initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -85,6 +87,19 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS execution_delivery_parts (
+             execution_id TEXT NOT NULL,
+             part_index INTEGER NOT NULL CHECK(part_index >= 0),
+             status TEXT NOT NULL CHECK(status IN
+               ('local_handoff','platform_accepted','failed','outcome_unknown')),
+             message_id TEXT,
+             error TEXT,
+             recorded_at TEXT NOT NULL,
+             PRIMARY KEY (execution_id, part_index),
+             FOREIGN KEY (execution_id) REFERENCES executions(id) ON DELETE CASCADE
+           )"""
     )
 
 
@@ -267,6 +282,53 @@ def finish_execution(
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     return record
+
+
+def record_execution_delivery_part(
+    execution_id: str, part_index: int, status: str, *,
+    message_id: Optional[str] = None, error: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Append one immutable, zero-based multipart delivery outcome.
+
+    ``platform_accepted`` is transport acceptance only, not physical receipt or a read
+    acknowledgement. ``message_id`` is retained only when the public adapter returned one.
+    """
+    allowed = {"local_handoff", "platform_accepted", "failed", "outcome_unknown"}
+    if status not in allowed:
+        raise ValueError(f"invalid multipart delivery status: {status}")
+    if not isinstance(part_index, int) or isinstance(part_index, bool) or part_index < 0:
+        raise ValueError("part_index must be a zero-based non-negative integer")
+    if status != "platform_accepted" and message_id is not None:
+        raise ValueError("message_id is only valid for platform_accepted")
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cur = conn.execute(
+            """INSERT INTO execution_delivery_parts
+               (execution_id, part_index, status, message_id, error, recorded_at)
+               SELECT ?, ?, ?, ?, ?, ?
+               WHERE EXISTS (
+                 SELECT 1 FROM executions WHERE id=? AND status='running'
+                   AND process_id=? AND pid=?)""",
+            (str(execution_id), part_index, status, message_id, error, now,
+             str(execution_id), _PROCESS_ID, os.getpid()),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("multipart delivery part could not be recorded for running execution")
+        row = conn.execute(
+            "SELECT * FROM execution_delivery_parts WHERE execution_id=? AND part_index=?",
+            (str(execution_id), part_index),
+        ).fetchone()
+    return dict(row)
+
+
+def list_execution_delivery_parts(execution_id: str) -> List[Dict[str, Any]]:
+    """Return persisted multipart outcomes in declared zero-based order."""
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT * FROM execution_delivery_parts WHERE execution_id=? ORDER BY part_index",
+            (str(execution_id),),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def recover_interrupted_executions() -> int:

@@ -607,7 +607,8 @@ def _action_create(a: Dict[str, Any]) -> str:
             base_url=_normalize_optional_job_value(a["base_url"], strip_trailing_slash=True),
             script=_normalize_optional_job_value(script), context_from=context_from,
             enabled_toolsets=a["enabled_toolsets"] or None, workdir=_normalize_optional_job_value(a["workdir"]),
-            no_agent=_no_agent, attach_to_session=a["attach_to_session"],
+            no_agent=_no_agent, no_agent_output=a["no_agent_output"],
+            attach_to_session=a["attach_to_session"],
             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
@@ -824,6 +825,10 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
                 "Cannot set no_agent=True on a job without a script. "
                 "Set `script` in the same update, or on the job first.")
         updates["no_agent"] = target_no_agent
+    if a["no_agent_output"] is not None:
+        updates["no_agent_output"] = a["no_agent_output"] or None
+    if _pick(updates, job, "no_agent_output") and not _pick(updates, job, "no_agent"):
+        return "no_agent_output requires no_agent=True"
     if a["repeat"] is not None:
         # Shared chokepoint coerces string forms ('forever'/'once'/'3') and 0/negative.
         from cron.jobs import normalize_repeat_value
@@ -952,6 +957,7 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    no_agent_output: Optional[str] = None,
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
@@ -1036,6 +1042,11 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "name": {
                 "type": "string",
                 "description": "Optional human-friendly name"
+            },
+            "no_agent_output": {
+                "type": "string",
+                "enum": ["multipart-v1"],
+                "description": "Opt-in strict versioned multipart JSON stdout for no_agent jobs."
             },
             "repeat": {
                 "type": "integer",

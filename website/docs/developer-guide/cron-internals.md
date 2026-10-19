@@ -358,6 +358,14 @@ By default (`cron.wrap_response: true`), cron deliveries are wrapped with:
 - A header identifying the cron job name and task
 - A footer noting the agent cannot see the delivered message in conversation
 
+Opted-in no-agent `multipart-v1` output is the exception: `cron.multipart_output` validates
+the complete versioned JSON envelope before any delivery, and the scheduler calls the same
+public delivery path once per validated body with wrapping disabled. The execution ledger's
+`execution_delivery_parts` rows use `(execution_id, zero-based part_index)` identity and record
+one of `local_handoff`, `platform_accepted`, `failed`, or `outcome_unknown`. A failed or unknown
+part terminates the sequence. These are handoff/adapter outcomes, not physical-receipt or read
+acknowledgements; `message_id` is nullable and populated only from an adapter result.
+
 The `[SILENT]` prefix in a cron response suppresses delivery entirely — useful for jobs that only need to write to files or perform side effects.
 
 ### Session Isolation

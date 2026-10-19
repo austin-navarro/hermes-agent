@@ -869,6 +869,33 @@ Semantics:
 - `{"wakeAgent": false}` on the last line → silent tick (same gate LLM jobs use).
 - No tokens, no model, no provider fallback — the job never touches the inference layer.
 
+### Opt-in multipart output
+
+A no-agent job may deliver several separate ordered text messages by adding
+`--no-agent-output multipart-v1` (or `no_agent_output="multipart-v1"` through the
+`cronjob` tool). Its complete stdout must then be one JSON object with exactly these keys:
+
+```json
+{"version":"hermes-no-agent-multipart/v1","messages":["first body","second body"]}
+```
+
+`messages` contains 1–10 nonempty text strings. Each body is limited to 4,000 characters
+and 4,000 UTF-8 bytes; all bodies together are limited to 20,000 UTF-8 bytes. Duplicate
+keys, unknown keys, malformed JSON, unsupported versions, non-text parts, empty parts, and
+oversized output fail the run before delivery. The envelope cannot specify recipients,
+commands, or attachments; the job's existing `deliver` setting remains authoritative.
+
+Hermes sends each body separately, in array order, without the normal cron header/footer.
+It stops before later parts after a definite failure or an uncertain result. Part indexes are
+zero-based and recorded with the execution ID. `platform_accepted` means only that the public
+adapter accepted the send; it does not mean physical receipt or read acknowledgement.
+`outcome_unknown` means Hermes cannot safely decide whether the platform accepted the part,
+and therefore does not continue. `local_handoff` identifies a local/queued handoff rather than
+platform acceptance. A platform message ID is recorded only when the adapter returns one.
+
+Jobs without `--no-agent-output multipart-v1` keep the existing single-message stdout behavior;
+JSON-looking stdout is not interpreted.
+
 `.sh` / `.bash` files run under `bash` from `PATH` when available, otherwise `/bin/bash` (important on Windows Git Bash). Anything else runs under the current Python interpreter (`sys.executable`). Scripts must resolve inside `$HERMES_HOME/scripts/` — relative names, absolute paths, and `~`-prefixed paths are accepted when the resolved target stays in that directory; paths that escape it are rejected. Subprocess env is sanitized (`_sanitize_subprocess_env`): provider API credentials and other Hermes-managed secrets are **not** inherited by cron scripts.
 
 #### Giving a script a credential

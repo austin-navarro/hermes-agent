@@ -473,7 +473,7 @@ from cron.jobs import (
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
-    recover_interrupted_executions)
+    record_execution_delivery_part, recover_interrupted_executions)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -1325,6 +1325,15 @@ def _run_no_agent_job(
     if not output.strip():
         logger.info("Job '%s' (no_agent): empty stdout — silent run", job_id)
         return True, f"{header}**Status:** silent (empty output)\n", SILENT_MARKER, None
+
+    if job.get("no_agent_output") == "multipart-v1":
+        from cron.multipart_output import MultipartOutputError, parse_multipart_v1
+        try:
+            job["_multipart_messages"] = parse_multipart_v1(output)
+        except MultipartOutputError as exc:
+            error = f"Invalid multipart-v1 output: {exc}"
+            job["_multipart_validation_failed"] = True
+            return False, f"{header}**Status:** invalid multipart output\n\n{error}\n", "", error
 
     return True, f"{header}\n---\n\n{output}\n", output, None
 
@@ -2731,6 +2740,44 @@ class _RunDelivery:
     side_effect_ownership_lost: bool = False
 
 
+def _deliver_multipart_messages(
+    job: dict, messages: tuple[str, ...], *, adapters=None, loop=None,
+) -> Optional[str]:
+    """Deliver validated bodies separately and stop after failed or uncertain acceptance."""
+    execution_id = str(job.get("execution_id") or "")
+    for part_index, body in enumerate(messages):
+        job.pop("_last_delivery_message_ids", None)
+        job["last_delivery_unverified"] = None
+        try:
+            error = _deliver_result(
+                job, body, adapters=adapters, loop=loop, verbatim=True,
+                delivery_identity=f"{execution_id}:part:{part_index}")
+        except Exception as exc:
+            detail = f"multipart part {part_index} outcome unknown: {exc}"
+            record_execution_delivery_part(
+                execution_id, part_index, "outcome_unknown", error=detail)
+            return detail
+
+        message_ids = job.pop("_last_delivery_message_ids", [])
+        message_id = str(message_ids[0]) if len(message_ids) == 1 else None
+        if error:
+            detail = f"multipart part {part_index} failed: {error}"
+            record_execution_delivery_part(execution_id, part_index, "failed", error=detail)
+            return detail
+        if job.get("last_delivery_unverified"):
+            detail = f"multipart part {part_index} outcome unknown: adapter returned no evidence"
+            record_execution_delivery_part(
+                execution_id, part_index, "outcome_unknown", error=detail)
+            return detail
+        if job.get("last_delivery_queued") or _normalize_deliver_value(job.get("deliver")) == "local":
+            record_execution_delivery_part(execution_id, part_index, "local_handoff")
+            continue
+        kwargs = {"message_id": message_id} if message_id is not None else {}
+        record_execution_delivery_part(
+            execution_id, part_index, "platform_accepted", **kwargs)
+    return None
+
+
 def _save_compose_deliver(
     d: _RunDelivery, fence: _FireOwnership, final_response: str, output: str, *,
     adapters, loop, verbose: bool, execution_token,
@@ -2764,6 +2811,9 @@ def _save_compose_deliver(
         output_file=output_file, agent_declared=d.agent_declared)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
+    if job.pop("_multipart_validation_failed", False):
+        # The strict envelope contract rejects the complete result before any platform handoff.
+        d.should_deliver = False
     if d.should_deliver and not d.success and job.get("_model_unreachable"):
         # The model was never reached and a bounded automatic re-run will be scheduled
         # (cron/unreachable_retry.py): hold the failure notice — the re-run either
@@ -2798,15 +2848,20 @@ def _save_compose_deliver(
             if not owns_delivery:
                 raise _FireClaimLostDuringSideEffect
             d.delivery_attempted = True
-            d.delivery_error = _deliver_result(
-                job,
-                deliver_content,
-                adapters=adapters,
-                loop=loop,
-                # Failure summaries (and drift/blocked-config alerts composed into deliver_content
-                # on the failure path) honor the job's failure_deliver override (NS-788).
-                for_failure=not d.success,
-            )
+            multipart_messages = job.pop("_multipart_messages", None) if d.success else None
+            if multipart_messages is not None:
+                d.delivery_error = _deliver_multipart_messages(
+                    job, multipart_messages, adapters=adapters, loop=loop)
+            else:
+                d.delivery_error = _deliver_result(
+                    job,
+                    deliver_content,
+                    adapters=adapters,
+                    loop=loop,
+                    # Failure summaries (and drift/blocked-config alerts composed into deliver_content
+                    # on the failure path) honor the job's failure_deliver override (NS-788).
+                    for_failure=not d.success,
+                )
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
             raise

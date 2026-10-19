@@ -1637,6 +1637,15 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_no_agent_output(value: Any) -> Optional[str]:
+    """Validate the opt-in structured stdout contract name."""
+    if value in (None, ""):
+        return None
+    if value != "multipart-v1":
+        raise ValueError("no_agent_output must be 'multipart-v1' or unset")
+    return value
+
+
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1649,6 +1658,7 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "enabled_toolsets": lambda v: _normalize_str_list(v) if v else None,
     "workdir": _normalize_workdir,
     "no_agent": bool,
+    "no_agent_output": _normalize_no_agent_output,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
 }
@@ -1763,6 +1773,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    no_agent_output: Optional[str] = None,
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
@@ -1804,6 +1815,8 @@ def create_job(
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
 
     _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
+    if f["no_agent_output"] and not f["no_agent"]:
+        raise ValueError("no_agent_output requires no_agent=True")
     prompt_text = _coerce_job_text(prompt).strip()
     if not prompt_text and not f["script"] and not normalized_skills:
         raise ValueError(EMPTY_PAYLOAD_ERROR)
@@ -1865,7 +1878,7 @@ def create_job(
     # jobs.
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
-        ("failure_deliver", f["failure_deliver"]),
+        ("failure_deliver", f["failure_deliver"]), ("no_agent_output", f["no_agent_output"]),
     ):
         if value is not None:
             job[key] = value
@@ -2038,12 +2051,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         updated = _apply_skill_fields({**job, **updates})
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
-        if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+        if {"monitor_script", "monitor_url", "no_agent", "no_agent_output", "script"}.intersection(updates):
             _validate_job_mode_invariants(
                 updated.get("monitor_script") or None,
                 updated.get("monitor_url") or None,
                 bool(updated.get("no_agent")),
                 _normalize_job_optional_text(updated.get("script")))
+            if updated.get("no_agent_output") and not updated.get("no_agent"):
+                raise ValueError("no_agent_output requires no_agent=True")
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
         inference_fields_changed = bool(

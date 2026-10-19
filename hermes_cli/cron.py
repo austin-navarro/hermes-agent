@@ -590,7 +590,8 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("repeat", "repeat"), ("script", "script"), ("workdir", "workdir"),
                    ("model", "model"), ("provider", "model_provider"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
-                   ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"))
+                   ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
+                   ("no_agent_output", "no_agent_output"))
 
 
 def _job_api_kwargs(args) -> Dict[str, Any]:
@@ -603,6 +604,7 @@ _JOB_DETAIL_LINES = (
     ("monitor_script", "  Monitor: {} (agent runs only on output change)"),
     ("monitor_url", "  Monitor: {} (agent runs only on output change)"),
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),
+    ("no_agent_output", "  Output: {}"),
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
     ("workdir", "  Workdir: {}"))
 

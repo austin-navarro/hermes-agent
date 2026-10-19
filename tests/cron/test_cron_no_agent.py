@@ -69,6 +69,24 @@ def test_update_job_roundtrips_no_agent_flag(hermes_env):
     assert reloaded["no_agent"] is True
 
 
+def test_create_job_multipart_output_is_explicit_and_requires_no_agent(hermes_env):
+    from cron.jobs import create_job
+
+    script_path = hermes_env / "scripts" / "w.sh"
+    script_path.write_text("echo hi\n")
+    with pytest.raises(ValueError, match="requires no_agent=True"):
+        create_job(
+            prompt="agent job", schedule="every 5m", script="w.sh",
+            no_agent_output="multipart-v1", deliver="local",
+        )
+
+    job = create_job(
+        prompt=None, schedule="every 5m", script="w.sh", no_agent=True,
+        no_agent_output="multipart-v1", deliver="local",
+    )
+    assert job["no_agent_output"] == "multipart-v1"
+
+
 # ---------------------------------------------------------------------------
 # cronjob tool: API-layer validation
 # ---------------------------------------------------------------------------
@@ -105,6 +123,194 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert error is None
     assert "RAM 92% on host" in final_response
     assert "RAM 92% on host" in doc
+
+
+def test_multipart_v1_parser_accepts_exact_ordered_text_parts():
+    from cron.multipart_output import parse_multipart_v1
+
+    stdout = json.dumps({
+        "version": "hermes-no-agent-multipart/v1",
+        "messages": ["first body", "second\nbody"],
+    })
+
+    assert parse_multipart_v1(stdout) == ("first body", "second\nbody")
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        '{"version":"hermes-no-agent-multipart/v1","messages":["a"],"target":"x"}',
+        '{"version":"hermes-no-agent-multipart/v1","messages":["a"],"messages":["b"]}',
+        '{"version":"wrong","messages":["a"]}',
+        '{"version":"hermes-no-agent-multipart/v1","messages":[]}',
+        '{"version":"hermes-no-agent-multipart/v1","messages":[1]}',
+        '{"version":"hermes-no-agent-multipart/v1","messages":[""]}',
+        '{"version":"hermes-no-agent-multipart/v1","messages":["   "]}',
+        'not json',
+    ],
+)
+def test_multipart_v1_parser_rejects_invalid_envelopes_before_delivery(stdout):
+    from cron.multipart_output import MultipartOutputError, parse_multipart_v1
+
+    with pytest.raises(MultipartOutputError):
+        parse_multipart_v1(stdout)
+
+
+def test_multipart_v1_parser_enforces_part_count_part_bytes_and_total_bytes():
+    from cron.multipart_output import (
+        MAX_MULTIPART_MESSAGES,
+        MAX_MULTIPART_PART_BYTES,
+        MAX_MULTIPART_TOTAL_BYTES,
+        MultipartOutputError,
+        parse_multipart_v1,
+    )
+
+    invalid = (
+        {"version": "hermes-no-agent-multipart/v1", "messages": ["a"] * (MAX_MULTIPART_MESSAGES + 1)},
+        {"version": "hermes-no-agent-multipart/v1", "messages": ["é" * MAX_MULTIPART_PART_BYTES]},
+        {
+            "version": "hermes-no-agent-multipart/v1",
+            "messages": ["a" * MAX_MULTIPART_PART_BYTES] *
+                        ((MAX_MULTIPART_TOTAL_BYTES // MAX_MULTIPART_PART_BYTES) + 1),
+        },
+    )
+    for envelope in invalid:
+        with pytest.raises(MultipartOutputError):
+            parse_multipart_v1(json.dumps(envelope))
+
+
+def test_multipart_delivery_is_separate_ordered_and_records_platform_acceptance(
+    hermes_env, monkeypatch,
+):
+    import cron.scheduler as scheduler
+
+    delivered = []
+    recorded = []
+    job = {"id": "job-1", "execution_id": "exec-1", "deliver": "telegram"}
+
+    def deliver_one(_job, body, **_kwargs):
+        delivered.append(body)
+        _job["_last_delivery_message_ids"] = [f"msg-{len(delivered)}"]
+        return None
+
+    monkeypatch.setattr(scheduler, "_deliver_result", deliver_one)
+    monkeypatch.setattr(
+        scheduler, "record_execution_delivery_part",
+        lambda execution_id, part_index, status, **kw: recorded.append(
+            (execution_id, part_index, status, kw)),
+    )
+
+    error = scheduler._deliver_multipart_messages(job, ("first", "second"))
+
+    assert error is None
+    assert delivered == ["first", "second"]
+    assert recorded == [
+        ("exec-1", 0, "platform_accepted", {"message_id": "msg-1"}),
+        ("exec-1", 1, "platform_accepted", {"message_id": "msg-2"}),
+    ]
+
+
+@pytest.mark.parametrize("middle_status", ["failed", "outcome_unknown"])
+def test_multipart_delivery_stops_after_failed_or_unknown_part(
+    hermes_env, monkeypatch, middle_status,
+):
+    import cron.scheduler as scheduler
+
+    delivered = []
+    recorded = []
+    job = {"id": "job-1", "execution_id": "exec-1", "deliver": "telegram"}
+
+    def deliver_one(_job, body, **_kwargs):
+        delivered.append(body)
+        if len(delivered) == 2:
+            if middle_status == "failed":
+                return "definitive rejection"
+            _job["last_delivery_unverified"] = ["telegram:1"]
+        return None
+
+    monkeypatch.setattr(scheduler, "_deliver_result", deliver_one)
+    monkeypatch.setattr(
+        scheduler, "record_execution_delivery_part",
+        lambda execution_id, part_index, status, **kw: recorded.append(
+            (part_index, status, kw.get("error"))),
+    )
+
+    error = scheduler._deliver_multipart_messages(job, ("one", "two", "three"))
+
+    assert delivered == ["one", "two"]
+    assert [row[:2] for row in recorded] == [
+        (0, "platform_accepted"),
+        (1, middle_status),
+    ]
+    assert error
+
+
+def test_plain_no_agent_stdout_does_not_parse_json(hermes_env):
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    body = '{"version":"hermes-no-agent-multipart/v1","messages":["one","two"]}'
+    script_path = hermes_env / "scripts" / "plain.py"
+    script_path.write_text(f"print({body!r})\n", encoding="utf-8")
+    job = create_job(
+        prompt=None, schedule="every 5m", script="plain.py", no_agent=True, deliver="local"
+    )
+
+    success, _doc, final_response, error = run_job(job)
+
+    assert success is True
+    assert error is None
+    assert final_response == body
+    assert "_multipart_messages" not in job
+
+
+def test_opted_in_no_agent_stdout_is_validated_before_delivery(hermes_env):
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    script_path = hermes_env / "scripts" / "multipart.py"
+    envelope = {
+        "version": "hermes-no-agent-multipart/v1",
+        "messages": ["exact one", "exact two"],
+    }
+    script_path.write_text(f"print({json.dumps(envelope)!r})\n", encoding="utf-8")
+    job = create_job(
+        prompt=None, schedule="every 5m", script="multipart.py", no_agent=True,
+        no_agent_output="multipart-v1", deliver="local",
+    )
+
+    success, _doc, _final_response, error = run_job(job)
+
+    assert success is True
+    assert error is None
+    assert job["_multipart_messages"] == ("exact one", "exact two")
+
+
+def test_invalid_opted_in_no_agent_stdout_fails_before_delivery(hermes_env, monkeypatch):
+    from cron.jobs import create_job
+    import cron.scheduler as scheduler
+
+    script_path = hermes_env / "scripts" / "multipart.py"
+    script_path.write_text(
+        'print(\'{"version":"hermes-no-agent-multipart/v1","messages":[1]}\')\n',
+        encoding="utf-8",
+    )
+    job = create_job(
+        prompt=None, schedule="every 5m", script="multipart.py", no_agent=True,
+        no_agent_output="multipart-v1", deliver="telegram",
+    )
+    delivered = []
+    monkeypatch.setattr(
+        scheduler, "_deliver_result",
+        lambda _job, content, **_kwargs: delivered.append(content),
+    )
+
+    success, _doc, _final_response, error = scheduler.run_job(job)
+
+    assert success is False
+    assert error is not None
+    assert "Invalid multipart-v1 output" in error
+    assert delivered == []
 
 
 def test_run_job_no_agent_reloads_dotenv_before_script(hermes_env, monkeypatch):
