@@ -1799,15 +1799,35 @@ class GatewayNotificationsMixin:
         _command = getattr(session, "command", "") or ""
         _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
         _raw = redact_terminal_output(_raw, _command)
-        # Keep the last ~2000 chars snapped to a line boundary, with a marker when cut.
-        _LIMIT = 2000
-        # Truncate at line boundaries so notifications never start mid-line (fixes #23284). Keep the last
-        # ~2000 chars but snap to the nearest preceding newline, then prepend a truncation marker when
-        # output was cut.
-        if len(_raw) > _LIMIT:
-            _tail = _raw[-_LIMIT:]
+
+        # A local Bot Mode delivery runner prints one JSON receipt. Its ``reply`` is the
+        # teammate's terminal assistant body and may be several thousand characters
+        # represented as one escaped physical line. Tail-truncating that envelope loses the
+        # status heading and exact failure reason (and a final newline used to reduce it to an
+        # empty tail). Unwrap only the unmistakable runner receipt and give that bounded reply
+        # enough room to reach the sending agent intact.
+        _limit = 2000
+        if "bot_mode_dm.py" in _command and "--run-delivery" in _command:
+            try:
+                _receipt = json.loads(_raw)
+            except (TypeError, ValueError):
+                _receipt = None
+            if (
+                isinstance(_receipt, dict)
+                and _receipt.get("status") == "settled"
+                and isinstance(_receipt.get("reply"), str)
+            ):
+                _raw = _receipt["reply"]
+                _limit = 12000
+
+        # Keep a bounded tail snapped to a line boundary. Discard a partial first
+        # line only when another nonempty line follows it; a sole trailing newline
+        # must never turn a long one-line result into ``showing last 0 chars``.
+        if len(_raw) > _limit:
+            _tail = _raw[-_limit:]
             _nl = _tail.find("\n")
-            _tail = _tail[_nl + 1:] if _nl != -1 else _tail
+            if _nl != -1 and _tail[_nl + 1:]:
+                _tail = _tail[_nl + 1:]
             _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
         else:
             _out = _raw

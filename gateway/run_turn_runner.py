@@ -1232,6 +1232,11 @@ class TurnRunner:
         baked into the cached agent."""
         ctx = self._ctx
         runner = self._runner
+        # Display identity is trusted transport metadata, but unlike the stable sender ID it can
+        # change or disappear between turns. Rebind it unconditionally so a cached agent cannot
+        # leak a prior turn's name into pre_llm_call hooks.
+        user_name = getattr(ctx.source, "user_name", None)
+        agent._user_name = user_name if isinstance(user_name, str) and user_name.strip() else ""
         agent._notification_config = ctx.user_config
         agent._notification_platform = ctx.source.platform
         # ALWAYS attached (never gated to None): its body gates each event class, and subagent-

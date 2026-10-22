@@ -106,6 +106,45 @@ def _stop_after_sleeps(monkeypatch, runner, count):
     monkeypatch.setattr(asyncio, "sleep", _bounded_sleep)
 
 
+def test_bot_delivery_completion_preserves_terminal_reply_body():
+    """A settled Bot Mode receipt must reach the sender as reply text, not as a
+    one-line JSON envelope whose only newline can make tail truncation empty."""
+    reply = "OPERATOR_BLOCKED\n\nExact failure: protected path mismatch.\n" + ("evidence " * 500)
+    session = SimpleNamespace(
+        command="python tools/bot_mode_dm.py --run-delivery ...",
+        output_buffer=json.dumps(
+            {"reply": reply, "status": "settled", "delivery_id": "delivery-1"}
+        )
+        + "\n",
+        exit_code=0,
+        completion_reason="exited",
+        started_at=1.0,
+        parent_session_id="parent-1",
+    )
+
+    event = GatewayRunner._build_process_completion_event({}, session, "proc_bot_reply")
+
+    assert event["output"] == reply
+    assert event["output"].startswith("OPERATOR_BLOCKED")
+    assert "Exact failure: protected path mismatch." in event["output"]
+
+
+def test_process_completion_truncation_never_discards_a_single_long_line():
+    session = SimpleNamespace(
+        command="python worker.py",
+        output_buffer=("x" * 13000) + "\n",
+        exit_code=0,
+        completion_reason="exited",
+        started_at=1.0,
+        parent_session_id="parent-1",
+    )
+
+    event = GatewayRunner._build_process_completion_event({}, session, "proc_long_line")
+
+    assert "showing last 0 chars" not in event["output"]
+    assert event["output"].rstrip().endswith("x" * 100)
+
+
 def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registry):
     """Byte-identical queue replays produce one turn in one gateway lifecycle."""
     isolated = queue.Queue()

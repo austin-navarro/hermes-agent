@@ -690,6 +690,9 @@ def _collect_pre_llm_call_context(
         return ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+        user_name = getattr(agent, "_user_name", None)
+        if not isinstance(user_name, str) or not user_name.strip():
+            user_name = ""
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
@@ -702,6 +705,7 @@ def _collect_pre_llm_call_context(
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            user_name=user_name,
         )
         try:
             # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent
