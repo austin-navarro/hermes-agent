@@ -190,6 +190,8 @@ from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRouti
 from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_MEDIA_RETRIEVAL_MAX_ATTEMPTS = 3
+_MEDIA_RETRIEVAL_RETRY_DELAY_SECONDS = 0.1
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
 # closed with ``flood_control:{wait}`` so the caller's retry machinery owns the wait.
 # Longer server penalties fail closed with a ``flood_control:{wait}`` SendResult so the caller's retry
@@ -6673,6 +6675,27 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         else:
             self._enqueue_photo_event(self._photo_batch_key(event, msg), event)
 
+    async def _retrieve_image_bytes_with_retry(self, source: Any) -> tuple[Any, bytearray]:
+        """Get and download one Telegram image, retrying only transient read timeouts."""
+        for attempt in range(_MEDIA_RETRIEVAL_MAX_ATTEMPTS):
+            try:
+                file_obj = await source.get_file()
+                return file_obj, await file_obj.download_as_bytearray()
+            except Exception as exc:
+                retryable = False
+                for current in _iter_exception_graph(exc):
+                    cls = current.__class__
+                    module = cls.__module__.lower()
+                    name = cls.__name__.lower()
+                    if (module.startswith("telegram") and name == "timedout") or (
+                            name == "readtimeout" and (module.startswith("httpx") or module.startswith("httpcore"))):
+                        retryable = True
+                        break
+                if not retryable or attempt + 1 >= _MEDIA_RETRIEVAL_MAX_ATTEMPTS:
+                    raise
+                await asyncio.sleep(_MEDIA_RETRIEVAL_RETRY_DELAY_SECONDS)
+        raise RuntimeError("unreachable Telegram media retrieval retry state")
+
     @staticmethod
     def _ext_from_path(file_path: Optional[str], candidates, default: str) -> str:
         """First extension in ``candidates`` that ``file_path`` ends with (case-insensitive), else default."""
@@ -6742,8 +6765,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     event, f"The document is too large or its size could not be verified. Maximum: {self._max_doc_bytes // (1024 * 1024)} MB.")
             # Screenshots/photos sent as documents take the image cache + batching path.
             if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
-                file_obj = await doc.get_file()
-                image_bytes = await file_obj.download_as_bytearray()
+                file_obj, image_bytes = await self._retrieve_image_bytes_with_retry(doc)
                 image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
                 try:
                     cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=image_ext)
@@ -6834,8 +6856,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # Cache photo locally: Telegram's file URLs expire (~1 hour) before vision may run.
         if msg.photo:
             try:
-                file_obj = await msg.photo[-1].get_file()  # PhotoSize list sorted by size; largest last
-                image_bytes = await file_obj.download_as_bytearray()
+                file_obj, image_bytes = await self._retrieve_image_bytes_with_retry(
+                    msg.photo[-1])  # PhotoSize list sorted by size; largest last
                 ext = self._ext_from_path(file_obj.file_path, [".png", ".webp", ".gif", ".jpeg", ".jpg"], ".jpg")
                 self._set_cached_media(
                     event, await cache_image_from_bytes_async(bytes(image_bytes), ext=ext), f"image/{ext.lstrip('.')}", event.message_type,

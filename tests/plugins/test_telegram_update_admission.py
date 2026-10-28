@@ -11,10 +11,13 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import httpcore
+import httpx
 import pytest
 
 pytest.importorskip("telegram")
-from telegram import InlineQuery, Message, PhotoSize, Sticker, Update
+from telegram import Document, InlineQuery, Message, PhotoSize, Sticker, Update
+from telegram.error import TimedOut
 from telegram.ext import ApplicationHandlerStop, ConversationHandler, Defaults, MessageHandler, TypeHandler, filters
 from telegram.request import BaseRequest
 
@@ -65,6 +68,8 @@ def update(bot, uid=10, kind="text", *, edited=False, chat=42, text="hello", gro
         "media": {"sticker": {"file_id": "offline", "file_unique_id": "offline", "type": "regular",
                               "width": 128, "height": 128, "is_animated": True, "is_video": False}},
         "photo": {"photo": [{"file_id": "offline", "file_unique_id": "offline", "width": 1, "height": 1}]},
+        "image_document": {"document": {"file_id": "offline", "file_unique_id": "offline",
+                                         "file_name": "offline.png", "mime_type": "image/png", "file_size": 7}},
     }
     if kind == "album":
         message["media_group_id"] = "album"
@@ -886,3 +891,106 @@ async def test_slow_update_does_not_block_other_chats(monkeypatch):
         assert next(e.source.chat_id for e in delivered) == "43"
         same_chat = "\n".join(e.text for e in delivered if e.source.chat_id == "42")
         assert same_chat == "hello\nsecond"
+
+
+@pytest.mark.asyncio
+async def test_telegram_media_retry_photo_recovers_once_without_duplicate_effects(monkeypatch, tmp_path):
+    file_obj = SimpleNamespace(
+        file_path="offline.png", download_as_bytearray=AsyncMock(return_value=bytearray(b"offline")))
+    get_file = AsyncMock(side_effect=[TimedOut("transient photo timeout"), file_obj])
+    cache = AsyncMock(return_value=str(tmp_path / "photo.png"))
+    monkeypatch.setattr(PhotoSize, "get_file", get_file)
+    monkeypatch.setattr(tg_adapter, "cache_image_from_bytes_async", cache)
+    monkeypatch.setattr(tg_adapter, "_MEDIA_RETRIEVAL_RETRY_DELAY_SECONDS", 0)
+
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        adapter._media_batch_delay_seconds = 0.01
+        await app.process_update(update(app.bot, kind="photo"))
+        await asyncio.gather(*adapter._pending_photo_batch_tasks.values())
+
+        assert get_file.await_count == 2
+        assert file_obj.download_as_bytearray.await_count == 1
+        assert cache.await_count == 1
+        assert len(delivered) == 1
+        assert delivered[0].media_urls == [str(tmp_path / "photo.png")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_timeout", [httpx.ReadTimeout("httpx read timeout"), httpcore.ReadTimeout("httpcore read timeout")])
+async def test_telegram_media_retry_image_document_recovers_read_timeout_without_duplicate_effects(
+        monkeypatch, tmp_path, read_timeout):
+    timed_out_file = SimpleNamespace(
+        file_path="offline.png", download_as_bytearray=AsyncMock(side_effect=read_timeout))
+    recovered_file = SimpleNamespace(
+        file_path="offline.png", download_as_bytearray=AsyncMock(return_value=bytearray(b"offline")))
+    get_file = AsyncMock(side_effect=[timed_out_file, recovered_file])
+    cache = AsyncMock(return_value=str(tmp_path / "document.png"))
+    monkeypatch.setattr(Document, "get_file", get_file)
+    monkeypatch.setattr(tg_adapter, "cache_image_from_bytes_async", cache)
+    monkeypatch.setattr(tg_adapter, "_MEDIA_RETRIEVAL_RETRY_DELAY_SECONDS", 0)
+
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        adapter._media_batch_delay_seconds = 0.01
+        await app.process_update(update(app.bot, kind="image_document"))
+        await asyncio.gather(*adapter._pending_photo_batch_tasks.values())
+
+        assert get_file.await_count == 2
+        assert timed_out_file.download_as_bytearray.await_count == 1
+        assert recovered_file.download_as_bytearray.await_count == 1
+        assert cache.await_count == 1
+        assert len(delivered) == 1
+        assert delivered[0].media_urls == [str(tmp_path / "document.png")]
+
+
+@pytest.mark.asyncio
+async def test_telegram_media_retry_exhaustion_surfaces_existing_failure_without_media_dispatch(monkeypatch):
+    get_file = AsyncMock(side_effect=TimedOut("persistent photo timeout"))
+    cache = AsyncMock()
+    reply = AsyncMock()
+    monkeypatch.setattr(PhotoSize, "get_file", get_file)
+    monkeypatch.setattr(Message, "reply_text", reply)
+    monkeypatch.setattr(tg_adapter, "cache_image_from_bytes_async", cache)
+    monkeypatch.setattr(tg_adapter, "_MEDIA_RETRIEVAL_RETRY_DELAY_SECONDS", 0)
+
+    async with connected(monkeypatch) as (_adapter, app, delivered):
+        await app.process_update(update(app.bot, kind="photo"))
+
+        assert get_file.await_count == tg_adapter._MEDIA_RETRIEVAL_MAX_ATTEMPTS
+        assert cache.await_count == 0
+        assert reply.await_count == 1
+        assert len(delivered) == 1
+        assert delivered[0].media_urls == []
+        assert "could not be downloaded" in delivered[0].text
+
+
+@pytest.mark.asyncio
+async def test_telegram_media_retry_does_not_retry_unauthorized_oversized_or_cache_failure(monkeypatch, tmp_path):
+    get_photo = AsyncMock()
+    monkeypatch.setattr(PhotoSize, "get_file", get_photo)
+    async with connected(monkeypatch) as (_adapter, app, delivered):
+        await app.process_update(update(app.bot, kind="photo", user=99))
+        assert get_photo.await_count == 0
+        assert delivered == []
+
+    get_document = AsyncMock()
+    monkeypatch.setattr(Document, "get_file", get_document)
+    async with connected(monkeypatch) as (adapter, app, _delivered):
+        payload = update(app.bot, uid=11, kind="image_document").to_dict()
+        payload["message"]["document"]["file_size"] = adapter._max_doc_bytes + 1
+        await app.process_update(Update.de_json(payload, app.bot))
+        assert get_document.await_count == 0
+
+    file_obj = SimpleNamespace(
+        file_path="offline.png", download_as_bytearray=AsyncMock(return_value=bytearray(b"invalid")))
+    get_photo = AsyncMock(return_value=file_obj)
+    cache = AsyncMock(side_effect=ValueError("invalid image"))
+    reply = AsyncMock()
+    monkeypatch.setattr(PhotoSize, "get_file", get_photo)
+    monkeypatch.setattr(Message, "reply_text", reply)
+    monkeypatch.setattr(tg_adapter, "cache_image_from_bytes_async", cache)
+    monkeypatch.setattr(tg_adapter, "_MEDIA_RETRIEVAL_RETRY_DELAY_SECONDS", 0)
+    async with connected(monkeypatch) as (_adapter, app, _delivered):
+        await app.process_update(update(app.bot, uid=12, kind="photo"))
+        assert get_photo.await_count == 1
+        assert file_obj.download_as_bytearray.await_count == 1
+        assert cache.await_count == 1
