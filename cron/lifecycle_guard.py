@@ -1090,9 +1090,35 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 
 # --- recursive walk ---------------------------------------------------------------------------
 
+def _python_dispatch_reference_view(command: str, script_path: Path, source: str, cwd: Optional[str]) -> Optional[str]:
+    """Narrow direct-shebang CLI context; never infer Python from a suffix.
+
+    Wrappers, expanded argv and ambiguous shapes retain the original scan.
+    This is a reference-discovery view, not a reader exemption.
+    """
+    try:
+        first = source.split("\n", 1)[0]
+        if not first.startswith("#!") or not re.search(r"(?:/|\s)python(?:3(?:\.\d+)*)?(?:\s|$)", first):
+            return None
+        segments = list(_iter_command_segments(command))
+        if len(segments) != 1 or not segments[0]:
+            return None
+        tokens = segments[0]
+        if any(any(char in token for char in "$`*?[]{}") for token in tokens):
+            return None
+        candidates = list(_resolved_or_nothing(tokens[0], cwd))
+        if len(candidates) != 1 or _resolve_lenient(candidates[0]) != _resolve_lenient(script_path):
+            return None
+        from cron.python_dispatch_scan import python_dispatch_view
+        return python_dispatch_view(source, tokens[1:])
+    except Exception:
+        return None  # retain full recursion, never outer direct-only fallback
+
+
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+    reference_view: Optional[str] = None,
 ) -> bool:
     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
@@ -1105,10 +1131,10 @@ def _contains_unsafe_gateway_action(
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return executed
 
-    def recurse(text: str, cwd: Optional[str], executed: bool) -> bool:
+    def recurse(text: str, cwd: Optional[str], executed: bool, reference_view: Optional[str] = None) -> bool:
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
-            read_remote_script=read_remote_script, executed=executed,
+            read_remote_script=read_remote_script, executed=executed, reference_view=reference_view,
         )
 
     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
@@ -1116,7 +1142,10 @@ def _contains_unsafe_gateway_action(
     # oversized data file mentioned there otherwise fails closed as a "script".
     from tools.shell_heredoc import strip_inert_heredoc_bodies
 
-    walk_command = strip_inert_heredoc_bodies(command)
+    # The ORIGINAL source was budgeted and directly scanned above. Only
+    # recursive discovery may use a proven concrete CLI dispatch view.
+    discovery_text = command if reference_view is None else reference_view
+    walk_command = strip_inert_heredoc_bodies(discovery_text)
 
     for payload in _iter_shell_command_payloads(walk_command):
         if recurse(payload, cwd, executed):
@@ -1127,8 +1156,8 @@ def _contains_unsafe_gateway_action(
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
     candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
-    if walk_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+    if walk_command != discovery_text:
+        candidates += [(path, False) for path in _iter_referenced_shell_scripts(discovery_text, cwd=cwd)]
 
     for script_path, candidate_executed in candidates:
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
@@ -1176,7 +1205,8 @@ def _contains_unsafe_gateway_action(
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's directory, not the cwd.
-        if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed):
+        view = _python_dispatch_reference_view(command, script_path, script_text, cwd) if candidate_executed else None
+        if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed, view):
             return True
     return False
 
