@@ -55,6 +55,10 @@ def _no_managed_store(tmp_path, monkeypatch):
     """Point PM's store at an empty dir: script runs must not select the host install's
     dependency venv (POSIX cron scripts run on it when a store is committed)."""
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "no-pm-store"))
+    # An empty store must not fall through to the host checkout's parent
+    # payload manifest. Real payload discovery is covered on temporary roots.
+    from pm import environments
+    monkeypatch.setattr(environments, "_payload_manifest", lambda _root: None)
 
 
 @pytest.fixture(autouse=True)

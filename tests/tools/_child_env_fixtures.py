@@ -27,6 +27,9 @@ def child_env(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     from tools import env_passthrough
     from tools.environments import local
+    # This fixture selects an empty store, not the host checkout's payload.
+    from pm import environments
+    monkeypatch.setattr(environments, "_payload_manifest", lambda _root: None)
     monkeypatch.setattr(local, "_read_terminal_shell_init_config", lambda: ([], False))
     monkeypatch.setattr(env_passthrough, "_config_passthrough", {})
     # The skill-registered allowlist is a process-wide set (see #90004): the

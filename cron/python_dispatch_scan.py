@@ -62,6 +62,33 @@ def _guard_value(node, argv):
     return _UNKNOWN
 
 
+def _dispatch_match(test, name, argv):
+    """Recognize only literal list equality or a fixed-arity, indexed verb."""
+    match test:
+        case ast.Compare(left=ast.Name(id=left), ops=[ast.Eq()], comparators=[right]) if left == name:
+            option = _literal_strings(right)
+            return _UNKNOWN if option is _UNKNOWN else option == argv
+        case ast.BoolOp(op=ast.And(), values=[
+            ast.Compare(left=ast.Call(func=ast.Name(id='len'), args=[ast.Name(id=left)], keywords=[]),
+                        ops=[ast.Eq()], comparators=[ast.Constant(value=count)]),
+            ast.Compare(left=ast.Subscript(value=ast.Name(id=right), slice=ast.Constant(value=index)),
+                        ops=[ast.Eq()], comparators=[ast.Constant(value=verb)]),
+        ]) if (left == right == name and type(count) is int and type(index) is int
+               and 0 <= index < count and isinstance(verb, str)):
+            return len(argv) == count and argv[index] == verb
+    return _UNKNOWN
+
+
+def _dispatch_argument(node, name, argv):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node
+    if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == name
+            and isinstance(node.slice, ast.Constant) and type(node.slice.value) is int
+            and 0 <= node.slice.value < len(argv)):
+        return ast.copy_location(ast.Constant(value=argv[node.slice.value]), node)
+    return None
+
+
 def _selected_body(function, argv):
     args = function.args
     if len(args.args) != 1 or args.posonlyargs or args.vararg or args.kwarg or args.kwonlyargs or args.defaults:
@@ -73,21 +100,26 @@ def _selected_body(function, argv):
         return None
     branch = body[0]
     while isinstance(branch, ast.If):
-        test = branch.test
-        if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)
-                and isinstance(test.left, ast.Name) and test.left.id == args.args[0].arg):
+        match = _dispatch_match(branch.test, args.args[0].arg, argv)
+        if match is _UNKNOWN:
             return None
-        option = _literal_strings(test.comparators[0])
-        if option is _UNKNOWN:
-            return None
-        if option == argv:
-            # A single direct, no-argument local operation; no computed dispatch.
+        if match:
+            # Preserve concrete operand strings in the reference view, including
+            # script paths passed as argv values; never erase them as mere data.
             if len(branch.body) != 1 or not isinstance(branch.body[0], ast.Expr):
                 return None
             call = branch.body[0].value
-            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.args or call.keywords:
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.keywords:
                 return None
-            return call
+            values = []
+            for argument in call.args:
+                value = _dispatch_argument(argument, args.args[0].arg, argv)
+                if value is None:
+                    return None
+                values.append(value)
+            selected = copy.deepcopy(call)
+            selected.args = values
+            return selected
         if len(branch.orelse) != 1:
             return None
         branch = branch.orelse[0]
@@ -126,6 +158,21 @@ def python_dispatch_view(source: str, argv: list[str]) -> str | None:
             return None
         selected = _selected_body(main, argv)
         if selected is None or not isinstance(selected.func, ast.Name) or selected.func.id not in functions:
+            return None
+        # len() must be the builtin, and the dispatcher parameter cannot shadow
+        # the selected callable. Defaults/variadics would require a wider binder.
+        parameter = main.args.args[0].arg
+        if parameter in functions or parameter == 'len':
+            return None
+        for scope in (symbols, symbols.lookup('main').get_namespaces()[0]):
+            if 'len' in scope.get_identifiers():
+                binding = scope.lookup('len')
+                if binding.is_assigned() or binding.is_imported() or binding.is_parameter():
+                    return None
+        target_args = functions[selected.func.id].args
+        if (target_args.posonlyargs or target_args.vararg or target_args.kwarg
+                or target_args.kwonlyargs or target_args.defaults
+                or len(target_args.args) != len(selected.args)):
             return None
         # Allow sys.argv only at the one validated entry call or in fully
         # understood top-level guards. Defaults, keyword arguments and other
@@ -178,12 +225,16 @@ def python_dispatch_view(source: str, argv: list[str]) -> str | None:
                 return None
             if isinstance(n, ast.FunctionDef) and n.decorator_list:
                 return None
+            if isinstance(n, ast.Name) and n.id == '__builtins__':
+                return None  # the len builtin's namespace may escape or mutate
             if isinstance(n, (ast.Import, ast.ImportFrom)):
+                if isinstance(n, ast.ImportFrom) and n.module == 'builtins':
+                    return None
                 if isinstance(n, ast.ImportFrom) and n.module == 'sys' and any(alias.name in {'argv', '*'} for alias in n.names):
                     return None
                 for alias in n.names:
                     bound = alias.asname or alias.name.split('.')[0]
-                    if alias.name == '*' or bound in (set(functions) | {'__name__'}) or (alias.name == 'sys' and alias.asname not in {None, 'sys'}) or (bound == 'sys' and not (isinstance(n, ast.Import) and alias.name == 'sys')):
+                    if alias.name == '*' or alias.name == 'builtins' or bound in (set(functions) | {'__name__'}) or (alias.name == 'sys' and alias.asname not in {None, 'sys'}) or (bound == 'sys' and not (isinstance(n, ast.Import) and alias.name == 'sys')):
                         return None
             if isinstance(n, (ast.Global, ast.Nonlocal)):
                 return None
@@ -203,6 +254,14 @@ def python_dispatch_view(source: str, argv: list[str]) -> str | None:
         projected = copy.deepcopy(tree)
         projected_functions = {n.name: n for n in projected.body if isinstance(n, ast.FunctionDef)}
         projected_functions['main'].body = [ast.Expr(value=copy.deepcopy(selected))]
+        # Keep every concrete operand eligible for the existing bounded reader,
+        # even a suffixless relative script supplied through a parameter. These
+        # are reference-only mentions, not executable statements or exemptions.
+        projected_functions['main'].body.extend(
+            ast.Expr(value=ast.Constant(value=value.value if '/' in value.value else './' + value.value))
+            for value in selected.args
+            if isinstance(value, ast.Constant) and isinstance(value.value, str) and value.value
+        )
         top = []
         main_calls = 0
         for n in projected.body:

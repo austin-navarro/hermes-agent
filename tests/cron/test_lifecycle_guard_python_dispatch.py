@@ -28,6 +28,201 @@ def _runner(tmp_path):
     return runner, target
 
 
+def _parameterized_runner(tmp_path):
+    data = tmp_path / 'unrelated-data'
+    data.write_bytes(b'x' * (2 * 1024 * 1024))
+    helper = tmp_path / 'migration-helper.py'
+    helper.write_text(f'from pathlib import Path\nDATABASE = Path({str(data)!r})\n')
+    runner = tmp_path / 'parameterized.py'
+    runner.write_text(
+        '#!/usr/bin/env python3\nimport sys, subprocess\nfrom pathlib import Path\n'
+        'def check():\n    print("check")\n'
+        'def commit(release):\n    print(release)\n'
+        'def install(release):\n    print(release)\n'
+        'def migrate():\n'
+        f'    helper = Path({str(helper)!r})\n'
+        '    subprocess.run([sys.executable, str(helper)])\n'
+        'def main(argv):\n'
+        '    if argv == ["test"]:\n        check()\n'
+        '    elif len(argv) == 2 and argv[0] == "commit":\n        commit(argv[1])\n'
+        '    elif len(argv) == 2 and argv[0] == "install":\n        install(argv[1])\n'
+        '    elif argv == ["migrate"]:\n        migrate()\n'
+        '    else:\n        raise SystemExit(2)\n'
+        'if __name__ == "__main__":\n    main(sys.argv[1:])\n'
+    )
+    return runner, helper, data
+
+
+def test_parameterized_install_does_not_read_unselected_helper_or_data(tmp_path, monkeypatch):
+    runner, helper, data = _parameterized_runner(tmp_path)
+    reads = []
+    reader = guard._read_referenced_script
+
+    def record(path, **kwargs):
+        reads.append(path)
+        return reader(path, **kwargs)
+
+    monkeypatch.setattr(guard, '_read_referenced_script', record)
+    actual = guard.scan_gateway_lifecycle(f'{shlex.quote(str(runner))} install release', cwd=str(tmp_path))
+    assert actual == (False, None), {'actual': actual, 'reads': [str(path) for path in reads]}
+    assert runner in reads
+    assert helper not in reads
+    assert data not in reads
+
+
+@pytest.mark.parametrize('operand', ['argv[1]', '"fixed-release"'])
+def test_parameterized_literal_and_indexed_arguments_select_branch(tmp_path, operand):
+    runner, _, _ = _parameterized_runner(tmp_path)
+    runner.write_text(runner.read_text().replace('install(argv[1])', f'install({operand})'))
+    assert guard.scan_gateway_lifecycle(f'{runner} install release', cwd=str(tmp_path)) == (False, None)
+
+
+def test_parameterized_selected_executable_helper_still_blocks(tmp_path):
+    runner, _, data = _parameterized_runner(tmp_path)
+    runner.write_text(runner.read_text().replace(
+        'def install(release):\n    print(release)',
+        f'def install(release):\n    helper = Path({str(data)!r})\n'
+        '    subprocess.run([sys.executable, str(helper)])',
+    ))
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} install release', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(data) in refusal
+
+
+@pytest.mark.parametrize('operand_kind', ['absolute', 'relative', 'bare'])
+def test_parameterized_argv_executable_is_not_erased(tmp_path, monkeypatch, operand_kind):
+    runner, helper, data = _parameterized_runner(tmp_path)
+    runner.write_text(runner.read_text().replace(
+        'def install(release):\n    print(release)',
+        'def install(release):\n    subprocess.run([sys.executable, release])',
+    ))
+    reads = []
+    reader = guard._read_referenced_script
+
+    def record(path, **kwargs):
+        reads.append(path)
+        return reader(path, **kwargs)
+
+    monkeypatch.setattr(guard, '_read_referenced_script', record)
+    operand = {'absolute': str(data), 'relative': './' + data.name, 'bare': data.name}[operand_kind]
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} install {operand}', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(data) in refusal
+    assert data in reads
+    assert helper not in reads
+
+
+@pytest.mark.parametrize('operation', ['install', 'migrate'])
+def test_parameterized_literal_lifecycle_in_any_body_stays_blocked(tmp_path, operation):
+    runner, _, _ = _parameterized_runner(tmp_path)
+    source = runner.read_text()
+    insertion = '    subprocess.run("hermes gateway restart", shell=True)\n'
+    if operation == 'install':
+        source = source.replace('def install(release):\n', 'def install(release):\n' + insertion)
+    else:
+        source = source.replace('def migrate():\n', 'def migrate():\n' + insertion)
+    runner.write_text(source)
+    assert guard.scan_gateway_lifecycle(f'{runner} install release', cwd=str(tmp_path)) == (True, None)
+
+
+@pytest.mark.parametrize('condition', [
+    'choose(argv)',
+    'len(argv) != 2 and argv[0] == "install"',
+    'len(argv) == 2 or argv[0] == "install"',
+    'len(argv) == True and argv[0] == "install"',
+    'len(argv) == 2 and argv[-1] == "install"',
+    'len(argv) == 2 and argv[2] == "install"',
+    'len(argv) == 2 and argv[True] == "install"',
+])
+def test_parameterized_ambiguous_predicates_retain_full_scan(tmp_path, condition):
+    from cron.python_dispatch_scan import python_dispatch_view
+    runner, _, data = _parameterized_runner(tmp_path)
+    source = runner.read_text().replace('len(argv) == 2 and argv[0] == "install"', condition)
+    runner.write_text(source)
+    assert python_dispatch_view(source, ['install', 'release']) is None
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} install release', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(data) in refusal
+
+
+@pytest.mark.parametrize('call', [
+    'install(argv[-1])', 'install(argv[2])', 'install(argv[True])',
+    'install(argv[1:])', 'install(choose(argv))', 'install(*argv[1:])',
+    'install(release=argv[1])', 'dispatch[argv[0]](argv[1])',
+])
+def test_parameterized_unknown_operands_retain_full_scan(tmp_path, call):
+    from cron.python_dispatch_scan import python_dispatch_view
+    runner, _, data = _parameterized_runner(tmp_path)
+    source = runner.read_text().replace('install(argv[1])', call)
+    runner.write_text(source)
+    assert python_dispatch_view(source, ['install', 'release']) is None
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} install release', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(data) in refusal
+
+
+@pytest.mark.parametrize('signature', [
+    'release="default"', '*release', 'release, /', '*, release', 'release, other', '',
+])
+def test_parameterized_unsupported_binding_retain_full_scan(tmp_path, signature):
+    from cron.python_dispatch_scan import python_dispatch_view
+    runner, _, data = _parameterized_runner(tmp_path)
+    source = runner.read_text().replace('def install(release):', f'def install({signature}):')
+    runner.write_text(source)
+    assert python_dispatch_view(source, ['install', 'release']) is None
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} install release', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(data) in refusal
+
+
+@pytest.mark.parametrize('mutation', [
+    'len = lambda value: 2\n', 'from unknown import len\n',
+    'import builtins\nbuiltins.len = lambda value: 2\n',
+    '__builtins__["len"] = lambda value: 2\n',
+    'install = migrate\n', 'sys.argv[1] = "migrate"\n',
+    'alias = sys.argv\nalias.append("migrate")\n',
+])
+def test_parameterized_shadow_or_mutation_retains_full_scan(tmp_path, mutation):
+    from cron.python_dispatch_scan import python_dispatch_view
+    runner, _, data = _parameterized_runner(tmp_path)
+    source = runner.read_text().replace('if __name__ == "__main__":', mutation + 'if __name__ == "__main__":')
+    runner.write_text(source)
+    assert python_dispatch_view(source, ['install', 'release']) is None
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} install release', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(data) in refusal
+
+
+@pytest.mark.parametrize('parameter', ['len', 'install'])
+def test_parameterized_dispatch_parameter_cannot_shadow_proof_names(tmp_path, parameter):
+    from cron.python_dispatch_scan import python_dispatch_view
+    runner, _, data = _parameterized_runner(tmp_path)
+    source = runner.read_text().replace('argv', parameter).replace(f'sys.{parameter}', 'sys.argv')
+    runner.write_text(source)
+    assert python_dispatch_view(source, ['install', 'release']) is None
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} install release', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(data) in refusal
+
+
+@pytest.mark.parametrize('body', ['main(["migrate"])', 'globals()["install"]()', 'alias = main\n    alias(["migrate"])'])
+def test_parameterized_reflection_reentry_and_callback_retain_full_scan(tmp_path, body):
+    from cron.python_dispatch_scan import python_dispatch_view
+    runner, _, data = _parameterized_runner(tmp_path)
+    source = runner.read_text().replace('def install(release):\n    print(release)', f'def install(release):\n    {body}')
+    runner.write_text(source)
+    assert python_dispatch_view(source, ['install', 'release']) is None
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} install release', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(data) in refusal
+
+
+@pytest.mark.parametrize('prefix', ['env ', 'timeout 30 ', 'bash '])
+def test_parameterized_wrappers_keep_full_scan(tmp_path, prefix):
+    runner, _, data = _parameterized_runner(tmp_path)
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{prefix}{runner} install release', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(data) in refusal
+
+
+def test_parameterized_unselected_definition_default_is_still_scanned(tmp_path):
+    runner, _, data = _parameterized_runner(tmp_path)
+    runner.write_text(runner.read_text().replace('def migrate():', f'def migrate(argument=Path({str(data)!r})):'))
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} install release', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(data) in refusal
+
+
 def test_exact_dispatch_does_not_read_unselected_helper(tmp_path, monkeypatch):
     runner, target = _runner(tmp_path)
     reads = []

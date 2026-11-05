@@ -7,6 +7,9 @@ import sys
 
 import pytest
 from datetime import UTC
+from tests.cron.test_cron_execution_identity import (
+    _prepare_child_startup, _validate_child_env, _startup_records, _assert_child_startups,
+)
 
 
 _FIRE = """
@@ -42,15 +45,47 @@ else:
 """
 
 
-def _fire(home, mode):
-    env = {k: v for k, v in os.environ.items()
+def _child_env(home, parent=None):
+    env = {k: v for k, v in (os.environ if parent is None else parent).items()
            if not k.startswith(('HERMES_', '_HERMES_'))
            and not k.endswith(('_API_KEY', '_TOKEN'))}
     env['HERMES_HOME'] = str(home)
-    env['PYTHONPATH'] = str(Path(__file__).resolve().parents[2])
+    startup = _prepare_child_startup(home)
+    env['PYTHONPATH'] = os.pathsep.join([str(startup), str(Path(__file__).resolve().parents[2])])
+    env.update(HERMES_DISABLE_LAZY_INSTALLS="1", HERMES_TEST_ISOLATION=str(home),
+               HOME=str(home), USERPROFILE=str(home))
+    return env
+
+
+def test_child_env_contract(tmp_path):
+    parent = {name: "synthetic-only" for name in (
+        "OPENAI_API_KEY", "SERVICE_TOKEN", "HERMES_PROFILE",
+        "_HERMES_SESSION_ID", "HERMES_STATE_DB_GUARD_BYPASS",
+    )}
+    parent.update(HERMES_HOME="unrelated-home", HERMES_TEST_ISOLATION="unrelated-marker",
+                  HERMES_DISABLE_LAZY_INSTALLS="0", PATH="synthetic-path",
+                  HOME="foreign-ordinary-home", USERPROFILE="foreign-user-profile")
+    env = _child_env(tmp_path, parent)
+    assert env["HERMES_HOME"] == str(tmp_path)
+    assert env["HOME"] == env["USERPROFILE"] == str(tmp_path)
+    assert env["HERMES_DISABLE_LAZY_INSTALLS"] == "1"
+    assert env["HERMES_TEST_ISOLATION"] == str(tmp_path)
+    assert env["PYTHONPATH"].split(os.pathsep) == [str(tmp_path / ".cron-startup"), str(Path(__file__).resolve().parents[2])]
+    _validate_child_env(tmp_path, env)
+    assert env["PATH"] == "synthetic-path"
+    assert not set(parent).difference({"HERMES_HOME", "HERMES_TEST_ISOLATION",
+                                      "HERMES_DISABLE_LAZY_INSTALLS", "PATH", "HOME", "USERPROFILE"}) & env.keys()
+
+
+def _fire(home, mode):
+    env = _child_env(home)
+    _validate_child_env(home, env)
+    previous = {row['pid'] for row in _startup_records(home)}
     result = subprocess.run([sys.executable, '-c', _FIRE, mode], env=env,
                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "preparing dependencies" not in result.stderr and "Installing Python dependencies" not in result.stderr, result.stderr
+    _assert_child_startups(home, previous, result.stderr)
 
 
 @pytest.mark.parametrize('mode', ['builtin', 'provider', 'worker'])
