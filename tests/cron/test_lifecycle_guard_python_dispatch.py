@@ -194,3 +194,123 @@ def test_compiler_binding_forms_invalidate_dispatch_identity(tmp_path, binding):
     runner, _ = _runner(tmp_path)
     runner.write_text(runner.read_text().replace('if __name__ == "__main__":', binding + 'if __name__ == "__main__":') + 'else:\n    migrate()\n')
     assert guard.scan_gateway_lifecycle(f'{runner} test', cwd=str(tmp_path))[0] is True
+
+
+def _status_runner(tmp_path):
+    runner, target = _runner(tmp_path)
+    source = runner.read_text().replace(
+        'def test():', 'def git(*args):\n    print("local status")\ndef test():',
+    ).replace(
+        '    if argv == ["test"]:',
+        '    if argv == ["status"]:\n        git("status", "--short", "--branch")\n    elif argv == ["test"]:',
+    )
+    runner.write_text(source)
+    return runner, target
+
+
+def test_status_fixed_literal_dispatch_does_not_scan_unselected_helper(tmp_path, monkeypatch):
+    runner, target = _status_runner(tmp_path)
+    touches = []
+    reader = guard._read_referenced_script
+
+    def record(path, **kwargs):
+        touches.append(path)
+        return reader(path, **kwargs)
+
+    monkeypatch.setattr(guard, '_read_referenced_script', record)
+    assert guard.scan_gateway_lifecycle(f'{shlex.quote(str(runner))} status', cwd=str(tmp_path)) == (False, None)
+    assert runner in touches
+    assert target not in touches
+
+
+@pytest.mark.parametrize('operation', ['status', 'test'])
+def test_fixed_status_and_existing_test_keep_unselected_helper_unprobed(tmp_path, monkeypatch, operation):
+    from pathlib import Path
+
+    runner, target = _status_runner(tmp_path)
+    original_stat, original_lstat, original_open = Path.stat, Path.lstat, Path.open
+
+    def checked(original):
+        def record(path, *args, **kwargs):
+            assert path != target, 'unselected synthetic helper must not be probed'
+            return original(path, *args, **kwargs)
+        return record
+
+    monkeypatch.setattr(Path, 'stat', checked(original_stat))
+    monkeypatch.setattr(Path, 'lstat', checked(original_lstat))
+    monkeypatch.setattr(Path, 'open', checked(original_open))
+    assert guard.scan_gateway_lifecycle(f'{shlex.quote(str(runner))} {operation}', cwd=str(tmp_path)) == (False, None)
+
+
+@pytest.mark.parametrize('prefix', ['env ', 'timeout 30 '])
+@pytest.mark.parametrize('operation', ['status', 'test'])
+def test_fixed_status_and_existing_test_wrappers_retain_full_scan(tmp_path, prefix, operation):
+    runner, target = _status_runner(tmp_path)
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{prefix}{shlex.quote(str(runner))} {operation}', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(target) in refusal
+
+
+@pytest.mark.parametrize('site', ['selected', 'unselected'])
+def test_fixed_status_still_scans_full_original_source_for_lifecycle(tmp_path, site):
+    runner, _ = _status_runner(tmp_path)
+    source = runner.read_text()
+    command = 'subprocess.run("hermes gateway restart", shell=True)'
+    if site == 'selected':
+        source = source.replace('print("local status")', command)
+    else:
+        source = source.replace('def migrate():', f'def never_called():\n    {command}\ndef migrate():')
+    runner.write_text(source)
+    assert guard.scan_gateway_lifecycle(f'{runner} status', cwd=str(tmp_path)) == (True, None)
+
+
+@pytest.mark.parametrize('call', [
+    'git("status")',
+    'git("status", "--short")',
+    'git("status", "--branch", "--short")',
+    'git("push", "--short", "--branch")',
+    'git("status", "--short", "--branch", "extra")',
+    'git("status", "--short", None)',
+    'git("status", "--short", flag)',
+    'git("status", "--short", "--" + "branch")',
+    'git(*["status", "--short", "--branch"])',
+    'git("status", "--short", branch="--branch")',
+    'git("status", "--short", str("--branch"))',
+    'git("status", "--short", (flag := "--branch"))',
+    'git("status", "--short", "--branch")\n        git()',
+    'unknown.git("status", "--short", "--branch")',
+])
+def test_nonfixed_status_call_forms_retain_full_recursive_scan(tmp_path, call):
+    runner, target = _status_runner(tmp_path)
+    runner.write_text(runner.read_text().replace('git("status", "--short", "--branch")', call))
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} status', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(target) in refusal
+
+
+@pytest.mark.parametrize('operation', ['diff', 'commit', 'push', 'other'])
+def test_fixed_arguments_do_not_extend_other_dispatch_operations(tmp_path, operation):
+    runner, target = _status_runner(tmp_path)
+    runner.write_text(runner.read_text().replace('["status"]', f'[{operation!r}]'))
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} {operation}', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(target) in refusal
+
+
+@pytest.mark.parametrize('mutation', [
+    'git = migrate\n',
+    'from unknown import git\n',
+    'class git:\n    pass\n',
+    'sys.argv[1] = "migrate"\n',
+    'main(["migrate"])\n',
+])
+def test_fixed_status_preserves_binding_argv_and_reentry_fallback(tmp_path, mutation):
+    runner, target = _status_runner(tmp_path)
+    runner.write_text(runner.read_text().replace('if __name__ == "__main__":', mutation + 'if __name__ == "__main__":'))
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} status', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(target) in refusal
+
+
+@pytest.mark.parametrize('body', ['migrate()', 'main(["migrate"])', 'getattr(sys, "argv")'])
+def test_fixed_status_keeps_selected_references_reentry_and_reflection(tmp_path, body):
+    runner, target = _status_runner(tmp_path)
+    runner.write_text(runner.read_text().replace('print("local status")', body))
+    unsafe, refusal = guard.scan_gateway_lifecycle(f'{runner} status', cwd=str(tmp_path))
+    assert unsafe and refusal is not None and str(target) in refusal

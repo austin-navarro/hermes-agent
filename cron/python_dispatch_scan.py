@@ -83,12 +83,18 @@ def _selected_body(function, argv):
         if option is _UNKNOWN:
             return None
         if option == argv:
-            # A single direct, no-argument local operation; no computed dispatch.
+            # One direct local operation. Only status has a fixed literal-argument form.
             if len(branch.body) != 1 or not isinstance(branch.body[0], ast.Expr):
                 return None
             call = branch.body[0].value
-            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.args or call.keywords:
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.keywords:
                 return None
+            if call.args:
+                if argv != ['status'] or len(call.args) != 3:
+                    return None
+                for arg, expected in zip(call.args, ('status', '--short', '--branch')):
+                    if not (isinstance(arg, ast.Constant) and type(arg.value) is str and arg.value == expected):
+                        return None
             return call
         if len(branch.orelse) != 1:
             return None
